@@ -154,7 +154,7 @@ export default function HomePage() {
                 Today's Snapshot
               </p>
               <h1 className="mt-2 text-2xl font-bold tracking-tight text-gray-900">
-                Welcome back, {patient?.name.split(' ')[0] || 'Friend'}
+                Welcome back, {familyName.split(' ')[0]}
               </h1>
               <p className="mt-1.5 text-sm leading-relaxed text-gray-500">
                 See Clara's latest check-in, mood, and any alerts that may need your attention.

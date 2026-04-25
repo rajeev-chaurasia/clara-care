@@ -241,6 +241,7 @@ class TwilioCallSession:
         _SYSTEM_PREFIXES = (
             "[CONVERSATION STATE",
             "[INTERNAL SYSTEM NOTE",
+            "[EMOTIONAL CONTEXT",
             "[MIDCALL_SENTIMENT",
             "[CONTEXT_INJECT",
             "[SYSTEM",
@@ -248,6 +249,7 @@ class TwilioCallSession:
             "Do NOT revisit topics",
             "Steer toward something",
             "Steer the conversation",
+            "Good news",
         )
         if any(text.strip().startswith(prefix) for prefix in _SYSTEM_PREFIXES):
             logger.debug(f"[TRANSCRIPT_FILTER] Suppressed system injection echo: {text[:80]}...")
@@ -394,11 +396,12 @@ class TwilioCallSession:
             if prev != sentiment and self.deepgram_agent and self.deepgram_agent.deepgram_ws:
                 guidance = self._midcall_analyzer.get_emotional_guidance(prev, sentiment)
                 if guidance:
-                    # Use injection queue to avoid InjectionRefused from Deepgram during active speech
-                    await self._queue_injection(guidance)
+                    # Use UpdatePrompt to silently steer the agent's emotional tone
+                    # (InjectAgentMessage would cause Clara to read this aloud)
+                    await self._send_update_prompt(guidance)
                     logger.info(
                         f"[MIDCALL_SENTIMENT] CallSid={self.call_sid} "
-                        f"shift={prev}→{sentiment}, queued guidance"
+                        f"shift={prev}→{sentiment}, sent UpdatePrompt"
                     )
 
         except asyncio.CancelledError:
