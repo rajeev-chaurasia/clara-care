@@ -136,14 +136,15 @@ async def analyze_transcript(
     dg_analysis = await _deepgram_analyze(transcript, patient_name=ctx.get("preferred_name", ""))
 
     # 2. Elder-care keyword analysis (safety, meds, loneliness, connection)
-    care_analysis = _elder_care_analysis(transcript, patient_meds)
+    care_analysis = _elder_care_analysis(transcript, patient_meds, patient_name=ctx.get("name", ""))
     
     # 3. Memory inconsistency detection (YES -> UNSURE -> NO pattern)
     memory_flags = _detect_memory_inconsistency(transcript)
     care_analysis["memory_inconsistency"] = memory_flags
     if memory_flags:
+        pname = ctx.get("preferred_name") or ctx.get("name", "").split()[0] if ctx.get("name") else "The patient"
         care_analysis["action_items"].append(
-            "She gave conflicting answers during the call, which may be worth watching."
+            f"{pname} gave conflicting answers during the call, which may be worth watching."
         )
     
     # 3.5 Generate rich summary via Gemini (replaces Deepgram's generic one)
@@ -246,7 +247,7 @@ async def _deepgram_analyze(transcript: str, patient_name: str = "") -> dict:
         return {}
 
 
-def _elder_care_analysis(transcript: str, medications: list[str]) -> dict:
+def _elder_care_analysis(transcript: str, medications: list[str], patient_name: str = "") -> dict:
     """
     Elder-care-specific keyword analysis for signals Deepgram
     doesn't natively detect (safety, meds, loneliness, connection).
@@ -284,7 +285,7 @@ def _elder_care_analysis(transcript: str, medications: list[str]) -> dict:
             break
     
     # Medication tracking — uses this patient's specific medication list
-    medication_status = _extract_medication_status(transcript, medications)
+    medication_status = _extract_medication_status(transcript, medications, patient_name=patient_name)
     
     # Action items from conversation
     action_items = []
@@ -411,7 +412,7 @@ def _merge_analysis(dg: dict, care: dict, transcript: str, patient_context: dict
         mood = mood_map.get(dg_sentiment, "neutral")
         score = dg.get("sentiment_score", 0)
         mood_map_label = {"positive": "upbeat and positive", "negative": "low or subdued", "neutral": "calm and neutral"}
-        mood_explanation = f"Her overall tone during the call felt {mood_map_label.get(dg_sentiment, 'neutral')}."
+        mood_explanation = f"{p['Pos']} overall tone during the call felt {mood_map_label.get(dg_sentiment, 'neutral')}."
     
     # Topics: trust Deepgram's semantic topics, then layer in our
     # keyword-detected elder-care signals that Deepgram can't catch
@@ -428,7 +429,7 @@ def _merge_analysis(dg: dict, care: dict, transcript: str, patient_context: dict
     # Action items: keyword-based elder-care items + Deepgram intents
     action_items = list(care.get("action_items", []))
     for intent in dg.get("intents", []):
-        item = f"She expressed a {intent.lower()} during the conversation"
+        item = f"{p['Sub']} expressed a {intent.lower()} during the conversation"
         if item not in action_items:
             action_items.append(item)
     
@@ -567,7 +568,7 @@ def _scan_safety_keywords(transcript: str) -> list[str]:
     return flags
 
 
-def _extract_medication_status(transcript: str, medications: list[str]) -> dict:
+def _extract_medication_status(transcript: str, medications: list[str], patient_name: str = "") -> dict:
     """
     Extract medication mentions and whether they were taken.
 
@@ -643,6 +644,7 @@ def _extract_medication_status(transcript: str, medications: list[str]) -> dict:
 
         # Build a human-readable note for this medication
         med_name = med.title()
+        p = get_pronouns(patient_name)
         if taken is True and was_corrected:
             note = f"{p['Sub']} initially said no to {med_name} but later confirmed {p['sub']} took it (pill box was empty)."
         elif taken is True:

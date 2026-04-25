@@ -235,6 +235,24 @@ class TwilioCallSession:
         Callback: Transcript available
         Store for conversation history + inject context memory periodically
         """
+        # Filter out internal system injections that the LLM echoed back.
+        # These are steering prompts injected via InjectAgentMessage —
+        # they should NEVER appear in the saved transcript or be spoken aloud.
+        _SYSTEM_PREFIXES = (
+            "[CONVERSATION STATE",
+            "[INTERNAL SYSTEM NOTE",
+            "[MIDCALL_SENTIMENT",
+            "[CONTEXT_INJECT",
+            "[SYSTEM",
+            "Topics already covered:",
+            "Do NOT revisit topics",
+            "Steer toward something",
+            "Steer the conversation",
+        )
+        if any(text.strip().startswith(prefix) for prefix in _SYSTEM_PREFIXES):
+            logger.debug(f"[TRANSCRIPT_FILTER] Suppressed system injection echo: {text[:80]}...")
+            return
+
         self.conversation_transcript.append({
             "speaker": speaker,
             "text": text,
@@ -265,7 +283,11 @@ class TwilioCallSession:
                 self._midcall_analyzer._task = asyncio.create_task(self._run_midcall_sentiment())
 
     async def _inject_conversation_state(self):
-        """Inject a conversation state summary into the LLM to prevent topic repetition."""
+        """
+        Inject a conversation state summary into the LLM to prevent topic repetition.
+        Uses Deepgram's UpdatePrompt (appends to system instructions silently)
+        instead of InjectAgentMessage (which forces the agent to speak the text aloud).
+        """
         try:
             # Build a compact state summary
             total_turns = len(self.conversation_transcript)
@@ -276,15 +298,17 @@ class TwilioCallSession:
 
             state_summary = self._topic_tracker.get_state_summary()
 
+            # UpdatePrompt APPENDS to the existing system prompt — keep it concise
             state_msg = (
-                f"[CONVERSATION STATE — Turn {total_turns}] "
-                f"{state_summary if state_summary else 'Topics covered so far: general chat. '} "
-                f"Recent exchanges: {recent_summary}. "
-                f"Do NOT revisit topics already covered. Move to something new or go deeper on the current topic."
+                f"\n\n[Turn {total_turns}] "
+                f"{state_summary if state_summary else 'Topics covered so far: general chat. '}"
+                f"Recent: {recent_summary}. "
+                f"Steer to a NEW topic. Do NOT revisit covered topics."
             )
 
-            # Use safe injection queue (handles InjectionRefused from Deepgram during active speech)
-            await self._queue_injection(state_msg)
+            # Send UpdatePrompt directly — no queuing needed since it doesn't
+            # conflict with agent speech (it only modifies future LLM reasoning)
+            await self._send_update_prompt(state_msg)
             logger.info(
                 f"[CONTEXT_INJECT] CallSid={self.call_sid} turn={self._patient_turn_count} "
                 f"topics={self._topic_tracker.topics_discussed}"
@@ -292,11 +316,32 @@ class TwilioCallSession:
         except Exception as e:
             logger.warning(f"[CONTEXT_INJECT] Failed: {e}")
 
+    async def _send_update_prompt(self, prompt_addition: str):
+        """
+        Send an UpdatePrompt message to Deepgram to silently append
+        to the agent's system instructions. Unlike InjectAgentMessage,
+        this does NOT cause the agent to speak — it only changes how
+        the LLM reasons in subsequent turns.
+        """
+        if not self.deepgram_agent or not self.deepgram_agent.deepgram_ws:
+            return
+
+        try:
+            msg = {"type": "UpdatePrompt", "prompt": prompt_addition}
+            await self.deepgram_agent.deepgram_ws.send(json.dumps(msg))
+            logger.debug(f"[UPDATE_PROMPT] Sent ({len(prompt_addition)} chars)")
+        except Exception as e:
+            logger.warning(f"[UPDATE_PROMPT] Failed: {e}")
+
     async def _queue_injection(self, content: str):
         """
         Queue an InjectAgentMessage for delivery during silence.
         If Clara is NOT speaking right now, sends immediately.
         If Clara IS speaking, queues for delivery when she stops.
+
+        NOTE: This is now only used for proactive engagement messages
+        (e.g. "Are you still there?"), NOT for context steering.
+        Context steering uses UpdatePrompt via _send_update_prompt().
         """
         if not self.deepgram_agent or not self.deepgram_agent.deepgram_ws:
             return
@@ -513,6 +558,8 @@ class TwilioCallSession:
                 
                 # Memory inconsistency alert (YES → UNSURE → NO pattern)
                 if memory_flags and self.deepgram_agent and self.deepgram_agent.function_handler:
+                    from app.cognitive.utils import get_pronouns
+                    mp = get_pronouns(patient.get("name") if patient else None)
                     logger.warning(
                         f"[MEMORY_ALERT] CallSid={self.call_sid} "
                         f"inconsistency={memory_flags[0][:100]}"
@@ -524,7 +571,7 @@ class TwilioCallSession:
                             "severity": "medium",
                             "alert_type": "cognitive_decline",
                             "message": (
-                                "During today's call, she gave conflicting answers to the same question — "
+                                f"During today's call, {mp['sub']} gave conflicting answers to the same question — "
                                 "first agreeing, then expressing doubt or saying the opposite. "
                                 "This kind of inconsistency can sometimes be an early sign of short-term "
                                 "memory difficulty and is worth watching over the coming conversations."
@@ -590,6 +637,19 @@ class TwilioCallSession:
                 logger.error("[SAFETY] Cannot create alerts — no function handler")
                 return
             
+            # Get patient pronouns for gender-aware alert messages
+            from app.cognitive.utils import get_pronouns
+            # Try to get patient name from data store
+            patient_name = None
+            try:
+                if self.deepgram_agent.function_handler and hasattr(self.deepgram_agent.function_handler, "cognitive_pipeline"):
+                    ds = self.deepgram_agent.function_handler.cognitive_pipeline.data_store
+                    pt = await ds.get_patient(self.patient_id)
+                    patient_name = pt.get("name") if pt else None
+            except Exception:
+                pass
+            ap = get_pronouns(patient_name)
+            
             # 1. Handle Safety Flags (High Severity)
             if safety_flags:
                 flag_summary = "; ".join(safety_flags[:3])
@@ -600,7 +660,7 @@ class TwilioCallSession:
                 )
                 
                 message = (
-                    f"She said something during today's call that is a cause for concern: {flag_summary}. "
+                    f"{ap['Sub']} said something during today's call that is a cause for concern: {flag_summary}. "
                     "This came up during an otherwise normal conversation and may need your immediate attention."
                     f"{action_text}"
                 )
@@ -624,9 +684,9 @@ class TwilioCallSession:
 
             # 2. Handle Desire to Connect (Medium Severity Opportunity)
             if analysis.get("desire_to_connect"):
-                context = analysis.get("connection_context", "she mentioned missing family")
+                context = analysis.get("connection_context", f"{ap['sub']} mentioned missing family")
                 message = (
-                    f"She seemed to be longing for more connection during today's call — {context}. "
+                    f"{ap['Sub']} seemed to be longing for more connection during today's call — {context}. "
                     "This is a good moment to reach out with a call or visit. "
                     "Even a short check-in can make a big difference."
                 )

@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useState, useRef } from 'react'
+import { useEffect, useState, useRef, useCallback } from 'react'
 import { Phone, PhoneOff } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
@@ -28,18 +28,62 @@ export default function LiveCallStatus({ patientId, compact = false }: LiveCallS
   const [loading, setLoading] = useState(true)
   const [lastChecked, setLastChecked] = useState<Date>(new Date())
   const [connected, setConnected] = useState(false)
+  const [mode, setMode] = useState<'sse' | 'polling'>('sse')
   const durationTimerRef = useRef<NodeJS.Timeout | null>(null)
   const startedAtRef = useRef<string | null>(null)
 
-  useEffect(() => {
-    let eventSource: EventSource | null = null
-    let reconnectTimeout: NodeJS.Timeout
+  // ── Polling fallback ────────────────────────────────────────────
+  const pollFallback = useCallback(() => {
+    let mounted = true
+    let pollTimeout: NodeJS.Timeout
 
-    function connect() {
+    async function poll() {
+      try {
+        const res = await fetch(`/api/live-status?patient_id=${patientId}`, {
+          cache: 'no-store',
+        })
+        if (!res.ok) throw new Error('Failed to fetch')
+        const data = await res.json()
+        if (mounted) {
+          setCallStatus(data)
+          setLastChecked(new Date())
+          setLoading(false)
+          setConnected(true)
+          if (data.is_active && data.started_at) {
+            startedAtRef.current = data.started_at
+          } else {
+            startedAtRef.current = null
+          }
+          pollTimeout = setTimeout(poll, data.is_active ? 5000 : 30000)
+        }
+      } catch {
+        if (mounted) {
+          setLoading(false)
+          pollTimeout = setTimeout(poll, 10000)
+        }
+      }
+    }
+
+    poll()
+    return () => {
+      mounted = false
+      if (pollTimeout) clearTimeout(pollTimeout)
+    }
+  }, [patientId])
+
+  // ── SSE primary, with automatic polling fallback ────────────────
+  useEffect(() => {
+    let cleanup: (() => void) | undefined
+
+    if (mode === 'sse') {
+      let eventSource: EventSource | null = null
+      let sseFailCount = 0
+
       eventSource = new EventSource(`/api/call-events?patient_id=${patientId}`)
 
       eventSource.onopen = () => {
         setConnected(true)
+        sseFailCount = 0
       }
 
       eventSource.onmessage = (event) => {
@@ -60,10 +104,7 @@ export default function LiveCallStatus({ patientId, compact = false }: LiveCallS
               startedAtRef.current = data.started_at
             }
           } else if (data.type === 'call_ended') {
-            setCallStatus({
-              is_active: false,
-              patient_id: data.patient_id,
-            })
+            setCallStatus({ is_active: false, patient_id: data.patient_id })
             startedAtRef.current = null
           }
         } catch (err) {
@@ -72,26 +113,32 @@ export default function LiveCallStatus({ patientId, compact = false }: LiveCallS
       }
 
       eventSource.onerror = () => {
+        sseFailCount++
         setConnected(false)
-        eventSource?.close()
-        // Reconnect after 5 seconds
-        reconnectTimeout = setTimeout(connect, 5000)
+        // If SSE fails 3 times in a row, fall back to polling permanently
+        if (sseFailCount >= 3) {
+          console.warn('[LiveCallStatus] SSE unavailable, falling back to polling')
+          eventSource?.close()
+          setMode('polling')
+        }
       }
-    }
 
-    connect()
+      cleanup = () => {
+        eventSource?.close()
+      }
+    } else {
+      // Polling mode
+      cleanup = pollFallback()
+    }
 
     return () => {
-      eventSource?.close()
-      if (reconnectTimeout) clearTimeout(reconnectTimeout)
+      cleanup?.()
     }
-  }, [patientId])
+  }, [patientId, mode, pollFallback])
 
-  // Client-side duration timer: updates every second during active calls
-  // so we don't need to poll the server for duration updates
+  // ── Client-side duration timer ──────────────────────────────────
   useEffect(() => {
     if (callStatus?.is_active && startedAtRef.current) {
-      // Update duration locally every second
       durationTimerRef.current = setInterval(() => {
         if (startedAtRef.current) {
           const elapsed = Math.floor(
@@ -151,7 +198,7 @@ export default function LiveCallStatus({ patientId, compact = false }: LiveCallS
                 connected ? "bg-green-400" : "bg-red-400"
               )} />
               <p className="text-[9px] text-gray-400">
-                {connected ? 'Live' : 'Reconnecting...'}
+                {connected ? (mode === 'sse' ? 'Live' : 'Polling') : 'Reconnecting...'}
               </p>
             </div>
           )}
@@ -173,10 +220,8 @@ export default function LiveCallStatus({ patientId, compact = false }: LiveCallS
       <div className="relative z-10 flex items-center gap-3">
         {/* Pulsing green dot with rings */}
         <div className="relative flex h-10 w-10 shrink-0 items-center justify-center">
-          {/* Outer pulse rings */}
           <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-75" />
           <span className="absolute inline-flex h-3/4 w-3/4 animate-pulse rounded-full bg-emerald-300 opacity-50" />
-          {/* Inner solid dot */}
           <span className="relative inline-flex h-4 w-4 shrink-0 rounded-full bg-gradient-to-br from-emerald-400 to-green-500 shadow-lg ring-2 ring-white" />
         </div>
 
