@@ -23,7 +23,7 @@ export default function HistoryPage() {
   useEffect(() => {
     async function load() {
       try {
-        const data = await getConversations(getPatientId())
+        const data = await getConversations(getPatientId(), 100)
         setConversations(data)
       } catch {
         setError('Failed to load conversations')
