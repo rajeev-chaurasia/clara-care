@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useRef } from 'react'
 import { Phone, PhoneOff } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
@@ -27,56 +27,94 @@ export default function LiveCallStatus({ patientId, compact = false }: LiveCallS
   const [callStatus, setCallStatus] = useState<CallStatus | null>(null)
   const [loading, setLoading] = useState(true)
   const [lastChecked, setLastChecked] = useState<Date>(new Date())
-  const [refreshing, setRefreshing] = useState(false)
+  const [connected, setConnected] = useState(false)
+  const durationTimerRef = useRef<NodeJS.Timeout | null>(null)
+  const startedAtRef = useRef<string | null>(null)
 
   useEffect(() => {
-    let mounted = true
-    let pollTimeout: NodeJS.Timeout
+    let eventSource: EventSource | null = null
+    let reconnectTimeout: NodeJS.Timeout
 
-    async function fetchCallStatus() {
-      // Set refreshing flag if not initial load
-      if (!loading) setRefreshing(true)
+    function connect() {
+      eventSource = new EventSource(`/api/call-events?patient_id=${patientId}`)
 
-      try {
-        const res = await fetch(`/api/live-status?patient_id=${patientId}`, {
-          cache: 'no-store',
-        })
-        if (!res.ok) throw new Error('Failed to fetch call status')
-        const data = await res.json()
+      eventSource.onopen = () => {
+        setConnected(true)
+      }
 
-        if (mounted) {
-          setCallStatus(data)
+      eventSource.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data)
           setLastChecked(new Date())
           setLoading(false)
-          setRefreshing(false)
 
-          // Continue polling - always refresh to catch call starts/ends
-          if (data.is_active) {
-            // During active call: poll every 2 seconds for real-time updates
-            pollTimeout = setTimeout(fetchCallStatus, 2000)
-          } else {
-            // When idle: poll every 5 seconds to quickly catch incoming calls
-            pollTimeout = setTimeout(fetchCallStatus, 5000)
+          if (data.type === 'status' || data.type === 'call_started') {
+            setCallStatus({
+              is_active: data.is_active,
+              call_sid: data.call_sid,
+              patient_id: data.patient_id,
+              duration_sec: data.duration_sec || 0,
+              started_at: data.started_at,
+            })
+            if (data.is_active && data.started_at) {
+              startedAtRef.current = data.started_at
+            }
+          } else if (data.type === 'call_ended') {
+            setCallStatus({
+              is_active: false,
+              patient_id: data.patient_id,
+            })
+            startedAtRef.current = null
           }
+        } catch (err) {
+          console.error('Error parsing SSE event:', err)
         }
-      } catch (error) {
-        console.error('Error fetching call status:', error)
-        if (mounted) {
-          setLoading(false)
-          setRefreshing(false)
-          // Retry after 3 seconds on error
-          pollTimeout = setTimeout(fetchCallStatus, 3000)
-        }
+      }
+
+      eventSource.onerror = () => {
+        setConnected(false)
+        eventSource?.close()
+        // Reconnect after 5 seconds
+        reconnectTimeout = setTimeout(connect, 5000)
       }
     }
 
-    fetchCallStatus()
+    connect()
 
     return () => {
-      mounted = false
-      if (pollTimeout) clearTimeout(pollTimeout)
+      eventSource?.close()
+      if (reconnectTimeout) clearTimeout(reconnectTimeout)
     }
   }, [patientId])
+
+  // Client-side duration timer: updates every second during active calls
+  // so we don't need to poll the server for duration updates
+  useEffect(() => {
+    if (callStatus?.is_active && startedAtRef.current) {
+      // Update duration locally every second
+      durationTimerRef.current = setInterval(() => {
+        if (startedAtRef.current) {
+          const elapsed = Math.floor(
+            (Date.now() - new Date(startedAtRef.current).getTime()) / 1000
+          )
+          setCallStatus((prev) =>
+            prev ? { ...prev, duration_sec: elapsed } : prev
+          )
+        }
+      }, 1000)
+    } else {
+      if (durationTimerRef.current) {
+        clearInterval(durationTimerRef.current)
+        durationTimerRef.current = null
+      }
+    }
+
+    return () => {
+      if (durationTimerRef.current) {
+        clearInterval(durationTimerRef.current)
+      }
+    }
+  }, [callStatus?.is_active])
 
   if (loading) {
     return (
@@ -85,7 +123,7 @@ export default function LiveCallStatus({ patientId, compact = false }: LiveCallS
         compact ? "flex-row" : "flex-col items-start"
       )}>
         <div className="h-2 w-2 animate-pulse rounded-full bg-gray-300" />
-        <span className="text-xs text-gray-500">Checking call status...</span>
+        <span className="text-xs text-gray-500">Connecting...</span>
       </div>
     )
   }
@@ -108,11 +146,12 @@ export default function LiveCallStatus({ patientId, compact = false }: LiveCallS
           </div>
           {!compact && (
             <div className="flex items-center gap-1.5">
-              {refreshing && (
-                <span className="h-1.5 w-1.5 animate-ping rounded-full bg-blue-400" />
-              )}
+              <span className={cn(
+                "h-1.5 w-1.5 rounded-full",
+                connected ? "bg-green-400" : "bg-red-400"
+              )} />
               <p className="text-[9px] text-gray-400">
-                Updated {lastChecked.toLocaleTimeString([], { minute: '2-digit', second: '2-digit' })}
+                {connected ? 'Live' : 'Reconnecting...'}
               </p>
             </div>
           )}
@@ -156,14 +195,6 @@ export default function LiveCallStatus({ patientId, compact = false }: LiveCallS
                 {formatDuration(callStatus.duration_sec)}
               </span>
             )}
-            <div className="flex items-center gap-1.5">
-              {refreshing && (
-                <span className="h-1.5 w-1.5 animate-ping rounded-full bg-emerald-400" />
-              )}
-              <span className="text-[9px] text-emerald-400">
-                Updated {lastChecked.toLocaleTimeString([], { minute: '2-digit', second: '2-digit' })}
-              </span>
-            </div>
           </div>
         </div>
       </div>

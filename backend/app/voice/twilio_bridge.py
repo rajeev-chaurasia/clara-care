@@ -18,6 +18,7 @@ from .agent import session_manager, DeepgramVoiceAgent
 from .topic_tracker import TopicTracker
 from .injection_queue import InjectionQueue
 from .mid_call_analyzer import MidCallAnalyzer
+from app.routes.call_events import publish_call_started, publish_call_ended
 
 logger = logging.getLogger(__name__)
 
@@ -148,6 +149,14 @@ class TwilioCallSession:
                 f"[CALL_START] CallSid={self.call_sid} patient={self.patient_id} "
                 f"pipeline={'enabled' if self.cognitive_pipeline else 'disabled'}"
             )
+            
+            # Push SSE event to dashboard
+            await publish_call_started(
+                patient_id=self.patient_id,
+                call_sid=self.call_sid,
+                started_at=self.call_start_time.isoformat() if self.call_start_time else None,
+            )
+            
             return True
             
         except Exception as e:
@@ -563,6 +572,13 @@ class TwilioCallSession:
         logger.info(
             f"[CALL_END] CallSid={self.call_sid} duration={call_duration_sec}s "
             f"turns={total_turns} pipeline={'success' if pipeline_result and pipeline_result.get('success') else 'skipped' if self.conversation_saved else 'failed'}"
+        )
+        
+        # Push SSE event to dashboard
+        await publish_call_ended(
+            patient_id=self.patient_id,
+            call_sid=self.call_sid,
+            duration_sec=call_duration_sec,
         )
     
     async def _create_safety_alerts(self, safety_flags: list, analysis: dict):
